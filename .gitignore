@@ -1,0 +1,12 @@
+/data/*
+checkpoints/
+
+/PressureVision/data/model/*
+
+runs/
+.idea/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class

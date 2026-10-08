@@ -1,0 +1,120 @@
+# Configuration for fine-tuning PressureVisionNet on "finger presses forearm".
+# Read by preprocessing/dataProcessor.py (processing block) and by
+# Model/dataset.py, model.py, train.py, evaluate.py (model_training block).
+# Relative paths are relative to the repo root (the directory of this file).
+
+processing:
+  raw_root: data/raw                 # session_* folders as written by the acquisition pipeline
+  output_root: data/processed        # one folder per session, read by Model/dataset.py
+
+  hand_tracking:
+    model_path: hand_landmarker.task
+    tracked_hand_label: null         # null = use meta_raw.json's hand_tracking.tracked_hand_label (the pressing hand)
+    fingertip_landmark_index: 8      # MediaPipe index fingertip
+    dip_landmark_index: 7            # MediaPipe index DIP joint (defines the finger axis)
+    max_gap_interp_frames: 5         # missing detections up to this many frames are interpolated
+    smoothing_window_frames: 9       # Savitzky-Golay window (odd), zero-phase over every tracked run
+    smoothing_polyorder: 2
+
+  crop:
+    # A square of fixed PHYSICAL size around the fingertip, resized to
+    # output_px. 160 mm -> 256 px is ~0.63 mm/px: close to the camera's native
+    # resolution at ~0.26 m (~0.38 mm/px) without upsampling, and to the
+    # ~0.6 mm/px scale PressureVisionNet was trained at, so the pretrained
+    # weights see fingers at the size they know.
+    side_mm: 160.0
+    output_px: 256                   # must be a multiple of 32 (FPN)
+    anchor_alpha: 0.0                # crop center = TIP - anchor_alpha * (TIP - DIP); 0 = centred on the fingertip
+    max_outside_fraction: 0.25       # frames whose crop lies more than this far outside the image are dropped
+    depth_sample_every_n: 10         # fingertip depth is measured every n-th frame; the session median sets the crop scale
+    fallback_depth_m: 0.265          # used if no valid fingertip depth is found in a session
+    jpeg_quality: 95
+
+  force:
+    cutoff_hz: 12.0                  # zero-phase Butterworth low-pass before resampling onto frame timestamps
+    order: 4
+    frame_time_offset_ms: 0.0        # added to frame timestamps before looking up force (camera latency compensation)
+    # Fz reads NEGATIVE while pressing; label force_n = max(-Fz, 0).
+    # Fz above this is the forearm being lifted off the plate (seen at the end
+    # of every session, +20..+40 N), not a press - those frames are excluded.
+    artifact_positive_n: 6.0
+    artifact_margin_s: 0.5           # also exclude this much time around every artifact
+
+  qc_strip_frames: 12
+
+model_training:
+  data_root: data/processed
+  splits:
+    # By session, never by frame (neighbouring frames are near-identical).
+    # Every PROCESSED_OK session is shuffled with split_seed and divided by
+    # these fractions; the resolved lists are saved as splits.json.
+    train_fraction: 0.70
+    val_fraction: 0.15
+    test_fraction: 0.15
+    split_seed: 0
+    # Optional manual override (a missing key means an empty split):
+    # train_sessions: [session_20261002_112827, ...]
+
+  frames:
+    train_stride: 3                  # use every n-th usable frame (30 fps is very redundant)
+    eval_stride: 3
+    max_force_n: 30.0                # frames with a larger label are excluded (no presses this hard were intended)
+
+  model:
+    pressurevision_root: PressureVision
+    # "pressurevision": official PressureVisionNet weights (paper_59.pt, downloaded if missing)
+    # "imagenet": ImageNet encoder only, random decoder/head (like the paper's own training run)
+    init_weights: pressurevision
+    pressurevision_checkpoint: PressureVision/data/model/paper_59.pt
+    # The 9-class pressure head is kept; its per-pixel class probabilities are
+    # turned into an expected pressure (kPa) with the paper's class centres,
+    # multiplied by one learnable gain (soft skin != rigid sensor), and summed
+    # over the crop's physical area to give the total force (N).
+    initial_gain: 1.0
+    # Encoder stages kept fixed at their starting weights (incl. BatchNorm
+    # statistics). Stage sizes: layer0 0.01M, layer1 0.23M, layer2 1.33M,
+    # layer3 7.8M, layer4 16.1M parameters. [] = fine-tune everything.
+    frozen_encoder_layers: [layer0, layer1, layer2]
+
+  augmentation:
+    horizontal_flip_prob: 0.5
+    rotation_max_deg: 15.0
+    scale_range: [0.85, 1.15]        # scaling also scales the pixel area used for the force integral
+    translate_max_frac: 0.08
+    brightness_jitter: 0.15          # multiplicative, no hue jitter: skin colour change is part of the signal
+    contrast_jitter: 0.15
+    blur_prob: 0.2                   # Gaussian blur (focus / motion), sigma uniform in [0, blur_max_sigma_px]
+    blur_max_sigma_px: 1.0
+    noise_std: 0.01                  # additive Gaussian pixel noise (image in [0, 1])
+
+  loader:
+    batch_size: 12
+    num_workers: 8
+
+  training:
+    seed: 42
+    max_epochs: 30
+    samples_per_epoch: null          # null = the whole (strided) train split every epoch
+    loss:
+      huber_delta_n: 1.0
+      # Spatial prior (0 = off, pure force-integral). Only the integral of the
+      # pressure map is supervised, so the network may put the pressure
+      # anywhere (the 1-epoch smoke run put it beside the finger); the
+      # fingertip is at the crop centre by construction, so this penalizes the
+      # share of pressure lying further than location_prior_radius_mm from it
+      # (contact frames only). It is added to train_loss, which is then no
+      # longer purely in newtons; val_loss / val_MAE do not include it.
+      location_prior_weight: 1.0
+      location_prior_radius_mm: 25.0
+    optimizer:
+      encoder_lr: 5.0e-5
+      decoder_lr: 2.0e-4             # FPN decoder + segmentation head
+      gain_lr: 1.0e-2
+      weight_decay: 1.0e-4
+    schedule:
+      warmup_epochs: 1.0             # linear warmup, then cosine decay to 0, stepped per optimizer step
+    grad_clip_max_norm: 1.0
+    early_stopping_patience: 6
+    contact_threshold_n: 0.5         # for contact accuracy / contact-only MAE in the metrics
+    checkpoint_dir: Model/checkpoints
+    metrics_history_file: metrics_history.csv
