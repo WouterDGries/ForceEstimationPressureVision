@@ -94,7 +94,7 @@ model_training:
   training:
     seed: 42
     max_epochs: 30
-    samples_per_epoch: null          # null = the whole (strided) train split every epoch
+    samples_per_epoch: 30000          # null = the whole (strided) train split every epoch
     loss:
       huber_delta_n: 1.0
       # Spatial prior (0 = off, pure force-integral). Only the integral of the
